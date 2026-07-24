@@ -11,7 +11,7 @@ fn which_ls() -> Result {
 fn which_alias_ls() -> Result {
     test()
         .run("alias ls = ls -a; which ls | get path.0 | str trim")
-        .expect_value_eq("source")
+        .expect_value_eq("nu-tester-0")
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn which_custom_alias() -> Result {
     test()
         .run(r#"alias foo = print "foo!"; which foo | to nuon"#)
         .expect_value_eq(
-            r#"[[command, path, type, definition]; [foo, source, alias, "print \"foo!\""]]"#,
+            r#"[[command, path, type, definition]; [foo, "nu-tester-0", alias, "print \"foo!\""]]"#,
         )
 }
 
@@ -37,7 +37,7 @@ fn correct_precedence_alias_def_custom() -> Result {
     // when an alias exists, so returning both entries would be misleading.
     test()
         .run("def ls [] {echo def}; alias ls = echo alias; which ls | get path.0 | str trim")
-        .expect_value_eq("source")
+        .expect_value_eq("nu-tester-0")
 }
 
 // `get_aliases_with_name` and `get_custom_commands_with_name` don't return the correct count of
@@ -173,4 +173,66 @@ fn which_external_command_reports_path() -> Result {
     assert!(!outcome.0.path.is_empty());
 
     Ok(())
+}
+
+// Regression test for #18419: on Windows, `which` must honor in-shell changes to
+// `$env.PATHEXT`, the same way it already honors changes to `$env.PATH`. `.qqq`
+// is not a normal executable extension, so `foo.qqq` is only found when the
+// shell's `$env.PATHEXT` includes `.QQQ`.
+#[cfg(windows)]
+#[test]
+fn which_respects_pathext_from_env() -> Result {
+    Playground::setup("which_pathext", |dirs, sandbox| {
+        sandbox.with_files(&[FileWithContentToBeTrimmed("foo.qqq", "")]);
+        let dir = dirs.test().display().to_string();
+
+        let found: i32 = test().cwd(dirs.test()).run(format!(
+            "with-env {{ Path: '{dir}', PATHEXT: '.QQQ' }} {{ which foo | length }}"
+        ))?;
+        assert_eq!(
+            found, 1,
+            "which should find foo.qqq when $env.PATHEXT has .QQQ"
+        );
+
+        let not_found: i32 = test().cwd(dirs.test()).run(format!(
+            "with-env {{ Path: '{dir}', PATHEXT: '.EXE' }} {{ which foo | length }}"
+        ))?;
+        assert_eq!(
+            not_found, 0,
+            "which should not find foo.qqq when $env.PATHEXT lacks .QQQ"
+        );
+
+        Ok(())
+    })
+}
+
+// A `PATHEXT` removed with `hide-env` must stay hidden: `which` must not fall
+// back to the process `PATHEXT`, which would resurrect the hidden value (the
+// process `PATHEXT` includes `.CMD` by default, so `foo.cmd` would be found
+// again).
+#[cfg(windows)]
+#[test]
+fn which_respects_hidden_pathext() -> Result {
+    Playground::setup("which_pathext_hidden", |dirs, sandbox| {
+        sandbox.with_files(&[FileWithContentToBeTrimmed("foo.cmd", "")]);
+        let dir = dirs.test().display().to_string();
+
+        let found: i32 = test().cwd(dirs.test()).run(format!(
+            "with-env {{ Path: '{dir}', PATHEXT: '.CMD' }} {{ which foo | length }}"
+        ))?;
+        assert_eq!(
+            found, 1,
+            "which should find foo.cmd when $env.PATHEXT has .CMD"
+        );
+
+        let hidden: i32 = test().cwd(dirs.test()).run(format!(
+            "with-env {{ Path: '{dir}', PATHEXT: '.CMD' }} {{ hide-env PATHEXT; which foo | length }}"
+        ))?;
+        assert_eq!(
+            hidden, 0,
+            "which should not resurrect a hidden $env.PATHEXT from the process environment"
+        );
+
+        Ok(())
+    })
 }
