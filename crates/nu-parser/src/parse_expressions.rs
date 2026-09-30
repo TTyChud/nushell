@@ -118,7 +118,8 @@ pub fn parse_list_expression(
     if bytes.ends_with(b"]") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("]", Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("]", open, Span::new(end, end)));
     }
 
     let inner_span = Span::new(start, end);
@@ -127,6 +128,18 @@ pub fn parse_list_expression(
     let (output, err) = lex(source, inner_span.start, &[b'\n', b'\r', b','], &[], true);
     if let Some(err) = err {
         working_set.error(err)
+    }
+
+    if let Some(token) = output
+        .iter()
+        .find(|token| token.contents == TokenContents::Semicolon)
+    {
+        working_set.error(ParseError::LabeledErrorWithHelp {
+            error: "Unexpected semicolon in list".into(),
+            label: "not a valid list separator".into(),
+            help: "Use commas or whitespace to separate list items.".into(),
+            span: token.span,
+        });
     }
 
     let (mut output, err) = lite_parse(&output, working_set);
@@ -241,7 +254,8 @@ pub(crate) fn parse_table_expression(
             span.end - 1
         } else {
             let end = span.end;
-            working_set.error(ParseError::Unclosed("]", Span::new(end, end)));
+            let open = ParseError::opener_span(span, 1);
+            working_set.error(ParseError::unclosed("]", open, Span::new(end, end)));
             span.end
         };
 
@@ -259,18 +273,26 @@ pub(crate) fn parse_table_expression(
     let [first, second, rest @ ..] = &tokens[..] else {
         return parse_list_expression(working_set, span, list_element_shape);
     };
+
     if !working_set.get_span_contents(first.span).starts_with(b"[")
         || second.contents != TokenContents::Semicolon
-        || rest.is_empty()
     {
         return parse_list_expression(working_set, span, list_element_shape);
-    };
+    }
+
     let head = parse_table_row(working_set, first.span);
 
     let errors = working_set.parse_errors.len();
 
     let (head, rows) = match head {
         Ok((head, _)) => {
+            if rest.is_empty() {
+                working_set.error(ParseError::Expected(
+                    "table row",
+                    Span::new(second.span.end, second.span.end),
+                ));
+            }
+
             let rows = rest
                 .iter()
                 .filter_map(|it| {
@@ -408,7 +430,8 @@ pub fn parse_block_expression(
     if bytes.ends_with(b"}") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("}", Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
         is_closed = false;
     }
 
@@ -435,6 +458,7 @@ pub fn parse_block_expression(
     let mut output = parse_block(working_set, &output, span, false, false, input_type);
 
     output.span = Some(span);
+    output.scope_bindings = working_set.snapshot_scope_bindings();
 
     if is_closed {
         working_set.exit_scope();
@@ -465,7 +489,8 @@ pub fn parse_match_block_expression(
     if bytes.ends_with(b"}") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("}", Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
         is_closed = false;
     }
 
@@ -691,7 +716,8 @@ pub fn parse_closure_expression(
     if bytes.ends_with(b"}") {
         end -= 1;
     } else {
-        working_set.error(ParseError::Unclosed("}", Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
         is_closed = false;
     }
 
@@ -733,7 +759,8 @@ pub fn parse_closure_expression(
             let end_point = if let Some(span) = end_span {
                 span.end
             } else {
-                working_set.error(ParseError::Unclosed("|", Span::new(end, end)));
+                let open = Span::new(start_point, start_point.saturating_add(1).min(end));
+                working_set.error(ParseError::unclosed("|", open, Span::new(end, end)));
                 end
             };
 
@@ -807,6 +834,7 @@ pub fn parse_closure_expression(
     }
 
     output.span = Some(span);
+    output.scope_bindings = working_set.snapshot_scope_bindings();
 
     if is_closed {
         working_set.exit_scope();
@@ -1029,7 +1057,19 @@ pub fn parse_assignment_expression(
             "right hand side of assignment",
             op_span,
         ));
-        return garbage(working_set, expr_span);
+        // Mirror an incomplete math expression: a `BinaryOp` with a garbage RHS, so AST
+        // consumers can still find the operator and lhs. The mutable-variable checks are
+        // skipped since the error above already reports the malformed assignment; the three
+        // parts are bound separately as each borrows `working_set` mutably.
+        let lhs = parse_expression(working_set, lhs_spans, None);
+        let operator = parse_assignment_operator(working_set, op_span);
+        let rhs = garbage(working_set, Span::point(op_span.end));
+        return Expression::new(
+            working_set,
+            Expr::BinaryOp(Box::new(lhs), Box::new(operator), Box::new(rhs)),
+            expr_span,
+            Type::Any,
+        );
     }
 
     // Parse the lhs and operator as usual for a math expression
@@ -1378,7 +1418,7 @@ pub fn parse_math_expression(
                 return garbage(working_set, spans[idx - 1]);
             }
         }
-        let mut rhs = parse_value(working_set, spans[idx], &SyntaxShape::Any, None);
+        let mut rhs = parse_value(working_set, spans[idx], &SyntaxShape::Any, input_type);
 
         for not_start_span in not_start_spans.iter().rev() {
             rhs = Expression::new(
@@ -1476,6 +1516,18 @@ pub fn parse_math_expression(
         .expect("internal error: expression stack empty")
 }
 
+/// Command heads that `parse_expression` treats specially when they appear in a pipeline.
+enum HeadKind {
+    Builtin,
+    Assign,
+    Overlay,
+    Where,
+    Run,
+    #[cfg(feature = "plugin")]
+    Plugin,
+    Other,
+}
+
 pub fn parse_expression(
     working_set: &mut StateWorkingSet,
     spans: &[Span],
@@ -1490,17 +1542,22 @@ pub fn parse_expression(
         // Check if there is any environment shorthand
         let name = working_set.get_span_contents(spans[pos]);
 
-        let split: Vec<_> = name.splitn(2, |x| *x == b'=').collect();
-        if split.len() != 2 || !is_env_variable_name(split[0]) {
+        // `NAME=value` shorthand: split at the first `=` (same as `splitn(2, ..)`, without the
+        // temporary `Vec`).
+        let Some(equals) = name.iter().position(|x| *x == b'=') else {
+            break;
+        };
+        if !is_env_variable_name(&name[..equals]) {
             break;
         }
 
-        let point = split[0].len() + 1;
+        let point = equals + 1;
+        let rhs_starts_with_dollar = name[point..].starts_with(b"$");
         let starting_error_count = working_set.parse_errors.len();
 
         let rhs = if spans[pos].start + point < spans[pos].end {
             let rhs_span = Span::new(spans[pos].start + point, spans[pos].end);
-            if split[1].starts_with(b"$") {
+            if rhs_starts_with_dollar {
                 parse_dollar_expr(working_set, rhs_span, &SyntaxShape::Any, None)
             } else {
                 parse_string_strict(working_set, rhs_span)
@@ -1539,23 +1596,35 @@ pub fn parse_expression(
     } else if is_math_expression_like(working_set, spans[pos]) {
         parse_math_expression(working_set, &spans[pos..], None, input_type)
     } else {
-        let bytes = working_set.get_span_contents(spans[pos]).to_vec();
+        // Classify the head first so the span bytes are only copied on the (error) paths that
+        // need an owned name.
+        let head = working_set.get_span_contents(spans[pos]);
+        let head_kind = match head {
+            b"def" | b"extern" | b"for" | b"module" | b"use" | b"source" | b"alias" | b"export"
+            | b"export-env" | b"hide" => HeadKind::Builtin,
+            b"const" | b"mut" => HeadKind::Assign,
+            b"overlay" => HeadKind::Overlay,
+            b"where" => HeadKind::Where,
+            b"run" => HeadKind::Run,
+            #[cfg(feature = "plugin")]
+            b"plugin" => HeadKind::Plugin,
+            _ => HeadKind::Other,
+        };
 
         // For now, check for special parses of certain keywords
-        match bytes.as_slice() {
-            b"def" | b"extern" | b"for" | b"module" | b"use" | b"source" | b"alias" | b"export"
-            | b"export-env" | b"hide" => {
+        match head_kind {
+            HeadKind::Builtin => {
                 working_set.error(ParseError::BuiltinCommandInPipeline(
-                    String::from_utf8(bytes)
+                    String::from_utf8(working_set.get_span_contents(spans[pos]).to_vec())
                         .expect("builtin commands bytes should be able to convert to string"),
                     spans[0],
                 ));
 
                 parse_call(working_set, &spans[pos..], spans[0], input_type)
             }
-            b"const" | b"mut" => {
+            HeadKind::Assign => {
                 working_set.error(ParseError::AssignInPipeline(
-                    String::from_utf8(bytes)
+                    String::from_utf8(working_set.get_span_contents(spans[pos]).to_vec())
                         .expect("builtin commands bytes should be able to convert to string"),
                     String::from_utf8_lossy(match spans.len() {
                         1..=3 => b"value",
@@ -1571,7 +1640,7 @@ pub fn parse_expression(
                 ));
                 parse_call(working_set, &spans[pos..], spans[0], input_type)
             }
-            b"overlay" => {
+            HeadKind::Overlay => {
                 if spans.len() > 1 && working_set.get_span_contents(spans[1]) == b"list" {
                     // whitelist 'overlay list'
                     parse_call(working_set, &spans[pos..], spans[0], input_type)
@@ -1584,10 +1653,10 @@ pub fn parse_expression(
                     parse_call(working_set, &spans[pos..], spans[0], input_type)
                 }
             }
-            b"where" => parse_where_expr(working_set, &spans[pos..]),
-            b"run" => parse_run_expr(working_set, &spans[pos..]),
+            HeadKind::Where => parse_where_expr(working_set, &spans[pos..]),
+            HeadKind::Run => parse_run_expr(working_set, &spans[pos..]),
             #[cfg(feature = "plugin")]
-            b"plugin" => {
+            HeadKind::Plugin => {
                 if spans.len() > 1 && working_set.get_span_contents(spans[1]) == b"use" {
                     // only 'plugin use' is banned
                     working_set.error(ParseError::BuiltinCommandInPipeline(
@@ -1599,7 +1668,7 @@ pub fn parse_expression(
                 parse_call(working_set, &spans[pos..], spans[0], input_type)
             }
 
-            _ => parse_call(working_set, &spans[pos..], spans[0], input_type),
+            HeadKind::Other => parse_call(working_set, &spans[pos..], spans[0], input_type),
         }
     };
 
@@ -1848,6 +1917,29 @@ fn check_record_key_or_value(
     }
 }
 
+/// Help text when a non-key token appears where a record key is expected.
+fn record_key_position_help(found: &[u8]) -> String {
+    match found {
+        b";" => "Records use newlines or commas between fields, not `;`. \
+                 `;` separates pipelines/statements in Nushell."
+            .into(),
+        b"," => "Unexpected comma here. Put commas between fields as `key: value, key2: value2`, \
+                 or use a newline instead."
+            .into(),
+        b"|" | b"||" => "Unexpected pipe in a record. Use `key: value` fields, or write a \
+                         closure with `|params|` if you meant a block."
+            .into(),
+        b"=" => "Record fields use `key: value` (colon), not `key = value`.".into(),
+        other => {
+            let token = String::from_utf8_lossy(other);
+            format!(
+                "Expected a record key, found `{token}`. Fields look like `key: value` \
+                 separated by newlines or commas."
+            )
+        }
+    }
+}
+
 pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression {
     let bytes = working_set.get_span_contents(span);
 
@@ -1878,7 +1970,7 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
         span_offset: start,
     };
     while !lex_state.input.is_empty() {
-        if let Some(ParseError::Unbalanced(left, right, _)) = lex_state.error.as_ref()
+        if let Some(ParseError::Unbalanced(left, right, ..)) = lex_state.error.as_ref()
             && *left == "{"
             && *right == "}"
         {
@@ -1912,7 +2004,8 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
     let (tokens, err) = (lex_state.output, lex_state.error);
 
     if unclosed {
-        working_set.error(ParseError::Unclosed("}", Span::new(end, end)));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
     } else if extra_tokens {
         working_set.error(ParseError::ExtraTokensAfterClosingDelimiter(Span::new(
             lex_state.span_offset,
@@ -1959,10 +2052,14 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
             // Normal key-value pair
             let field_token = &tokens[idx];
             let field = if field_token.contents != TokenContents::Item {
-                working_set.error(ParseError::Expected(
-                    "item in record key position",
-                    Span::new(field_token.span.start, field_token.span.end),
-                ));
+                let found = working_set.get_span_contents(field_token.span);
+                let help = record_key_position_help(found);
+                working_set.error(ParseError::LabeledErrorWithHelp {
+                    error: "Unexpected token in record".into(),
+                    label: "expected a record key here".into(),
+                    help,
+                    span: field_token.span,
+                });
                 garbage(working_set, curr_span)
             } else {
                 let field = parse_value(working_set, curr_span, &SyntaxShape::String, None);
@@ -1976,10 +2073,12 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
 
             idx += 1;
             if idx == tokens.len() {
-                working_set.error(ParseError::Expected(
-                    "':'",
-                    Span::new(curr_span.end, curr_span.end),
-                ));
+                working_set.error(ParseError::LabeledErrorWithHelp {
+                    error: "Incomplete record field".into(),
+                    label: "expected `:` after this key".into(),
+                    help: "Record fields look like `key: value`. Add a colon after the key.".into(),
+                    span: Span::new(curr_span.end, curr_span.end),
+                });
                 output.push(RecordItem::Pair(
                     garbage(working_set, curr_span),
                     garbage(working_set, Span::new(curr_span.end, curr_span.end)),
@@ -1990,10 +2089,14 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
             let colon = working_set.get_span_contents(colon_span);
             idx += 1;
             if colon != b":" {
-                working_set.error(ParseError::Expected(
-                    "':'",
-                    Span::new(colon_span.start, colon_span.start),
-                ));
+                let found = String::from_utf8_lossy(colon);
+                working_set.error(ParseError::LabeledErrorWithHelp {
+                    error: "Expected `:` after record key".into(),
+                    label: format!("expected `:`, found `{found}`"),
+                    help: "Record fields look like `key: value`. A missing colon often causes this field to be parsed as a block or closure."
+                        .into(),
+                    span: colon_span,
+                });
                 output.push(RecordItem::Pair(
                     field,
                     garbage(
@@ -2020,10 +2123,14 @@ pub fn parse_record(working_set: &mut StateWorkingSet, span: Span) -> Expression
 
             let value_token = &tokens[idx];
             let value = if value_token.contents != TokenContents::Item {
-                working_set.error(ParseError::Expected(
-                    "item in record value position",
-                    Span::new(value_token.span.start, value_token.span.end),
-                ));
+                let found = working_set.get_span_contents(value_token.span);
+                let found_disp = String::from_utf8_lossy(found);
+                working_set.error(ParseError::LabeledErrorWithHelp {
+                    error: "Unexpected token in record value".into(),
+                    label: format!("expected a value, found `{found_disp}`"),
+                    help: "After `key:`, provide a value (string, number, record, list, …).".into(),
+                    span: value_token.span,
+                });
                 garbage(
                     working_set,
                     Span::new(value_token.span.start, value_token.span.end),

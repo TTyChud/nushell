@@ -1,124 +1,37 @@
-use crate::{NuHelpCompleter, menus::NuMenuCompleter};
+use crate::{
+    NuHelpCompleter,
+    menus::{MenuLine, NuMenuCompleter, SourceMode, SourcedMenu},
+};
 use crossterm::event::{KeyCode, KeyModifiers};
 use nu_ansi_term::Style;
 use nu_color_config::{color_record_to_nustyle, lookup_ansi_color_style};
-use nu_engine::eval_block;
-use nu_parser::parse;
 use nu_protocol::{
-    Config, EditBindings, FromValue, ParsedKeybinding, ParsedMenu, PipelineData, Record,
-    ShellError, Span, Type, Value,
-    debugger::WithoutDebug,
-    engine::{EngineState, Stack, StateWorkingSet},
+    Config, EditBindings, ParsedKeybinding, ParsedMenu, Record, ShellError, Span, Type, Value,
+    engine::{Closure, EngineState, Stack},
     extract_value,
 };
 use reedline::{
     ColumnarMenu, DescriptionMenu, DescriptionMode, DescriptionPosition, Direction, EditCommand,
     EditCommandDiscriminants, FindStop, Granularity, IdeMenu, InputMode, Keybindings, ListMenu,
-    MenuBuilder, MotionTarget, OutputMode, PromptEditModeDiscriminants, Reedline, ReedlineEvent,
-    ReedlineEventDiscriminants, ReedlineMenu, TextObject, TextObjectScope, TextObjectType,
-    TraversalDirection, WordEdge, WordKind, default_emacs_keybindings,
-    default_vi_insert_keybindings, default_vi_normal_keybindings,
+    Menu, MenuBuilder, MotionTarget, OutputMode, PromptEditMode, PromptEditModeDiscriminants,
+    PromptHelixMode, PromptViMode, Reedline, ReedlineEvent, ReedlineEventDiscriminants,
+    ReedlineMenu, TextObject, TextObjectScope, TextObjectType, TraversalDirection, WordEdge,
+    WordKind, default_emacs_keybindings, default_vi_insert_keybindings,
+    default_vi_normal_keybindings, default_vi_visual_keybindings,
+};
+use reedline::{
+    default_helix_insert_keybindings, default_helix_normal_keybindings,
+    default_helix_select_keybindings,
 };
 use std::{str::FromStr, sync::Arc};
 
-const DEFAULT_COMPLETION_MENU: &str = r#"
-{
-  name: completion_menu
-  only_buffer_difference: false
-  marker: "| "
-  type: {
-      layout: columnar
-      columns: 4
-      col_width: 20
-      col_padding: 2
-      tab_traversal: "horizontal"
-  }
-  style: {
-      text: green,
-      selected_text: green_reverse
-      description_text: yellow
-  }
-}"#;
-
-const DEFAULT_IDE_COMPLETION_MENU: &str = r#"
-{
-  name: ide_completion_menu
-  only_buffer_difference: false
-  marker: "| "
-  type: {
-    layout: ide
-    min_completion_width: 0,
-    max_completion_width: 50,
-    max_completion_height: 10, # will be limited by the available lines in the terminal
-    padding: 0,
-    border: true,
-    cursor_offset: 0,
-    description_mode: "prefer_right"
-    min_description_width: 15
-    max_description_width: 50
-    max_description_height: 10
-    description_offset: 1
-    # If true, the cursor pos will be corrected, so the suggestions match up with the typed text
-    #
-    # C:\> str
-    #      str join
-    #      str trim
-    #      str split
-    correct_cursor_pos: false
-  }
-  style: {
-    text: green
-    selected_text: { attr: r }
-    description_text: yellow
-    match_text: { attr: u }
-    selected_match_text: { attr: ur }
-  }
-}"#;
-
-const DEFAULT_HISTORY_MENU: &str = r#"
-{
-  name: history_menu
-  only_buffer_difference: true
-  marker: "? "
-  type: {
-      layout: list
-      page_size: 10
-  }
-  style: {
-      text: green,
-      selected_text: green_reverse
-      description_text: yellow
-  }
-}"#;
-
-const DEFAULT_HELP_MENU: &str = r#"
-{
-  name: help_menu
-  only_buffer_difference: true
-  marker: "? "
-  type: {
-      layout: description
-      columns: 4
-      col_width: 20
-      col_padding: 2
-      selection_rows: 4
-      description_rows: 15
-  }
-  style: {
-      text: green,
-      selected_text: green_reverse
-      description_text: yellow
-  }
-}"#;
-
-// Adds all menus to line editor
+// Adds all menus from `$env.config.menus` (defaults live on `Config::default()`).
 pub(crate) fn add_menus(
     mut line_editor: Reedline,
     engine_state_ref: Arc<EngineState>,
     stack: &Stack,
     config: Arc<Config>,
 ) -> Result<Reedline, ShellError> {
-    //log::trace!("add_menus: config: {:#?}", &config);
     line_editor = line_editor.clear_menus();
 
     for menu in &config.menus {
@@ -129,62 +42,6 @@ pub(crate) fn add_menus(
             stack,
             config.clone(),
         )?
-    }
-
-    // Checking if the default menus have been added from the config file
-    let default_menus = [
-        ("completion_menu", DEFAULT_COMPLETION_MENU),
-        ("ide_completion_menu", DEFAULT_IDE_COMPLETION_MENU),
-        ("history_menu", DEFAULT_HISTORY_MENU),
-        ("help_menu", DEFAULT_HELP_MENU),
-    ];
-
-    let mut engine_state = (*engine_state_ref).clone();
-    let mut menu_eval_results = vec![];
-
-    for (name, definition) in default_menus {
-        if !config
-            .menus
-            .iter()
-            .any(|menu| menu.name.to_expanded_string("", &config) == name)
-        {
-            let (block, delta) = {
-                let mut working_set = StateWorkingSet::new(&engine_state);
-                let output = parse(
-                    &mut working_set,
-                    Some(name), // format!("repl_entry #{}", entry_num)
-                    definition.as_bytes(),
-                    true,
-                );
-
-                (output, working_set.render())
-            };
-
-            engine_state.merge_delta(delta)?;
-
-            let mut temp_stack = Stack::new().collect_value();
-            let input = PipelineData::empty();
-            menu_eval_results.push(eval_block::<WithoutDebug>(
-                &engine_state,
-                &mut temp_stack,
-                &block,
-                input,
-            )?);
-        }
-    }
-
-    let new_engine_state_ref = Arc::new(engine_state);
-
-    for res in menu_eval_results.into_iter().map(|p| p.body) {
-        if let PipelineData::Value(value, None) = res {
-            line_editor = add_menu(
-                line_editor,
-                &ParsedMenu::from_value(value)?,
-                new_engine_state_ref.clone(),
-                stack,
-                config.clone(),
-            )?;
-        }
     }
 
     Ok(line_editor)
@@ -307,6 +164,32 @@ fn parse_description_position(
     }
 }
 
+/// Menu with nushell source carrying editor line.
+fn menu_with_source<M: Menu + 'static>(
+    menu: M,
+    source: &Closure,
+    span: Span,
+    stack: &Stack,
+    engine_state: Arc<EngineState>,
+    input_mode: InputMode,
+) -> ReedlineMenu {
+    let mode = SourceMode::of(&input_mode);
+    let line = MenuLine::default();
+    let completer = NuMenuCompleter::new(
+        source.block_id,
+        span,
+        stack.captures_to_stack(source.captures.clone()),
+        engine_state,
+        mode,
+        line.clone(),
+    );
+
+    ReedlineMenu::WithCompleter {
+        menu: Box::new(SourcedMenu::new(menu, line, mode)),
+        completer: Box::new(completer),
+    }
+}
+
 /// Resolve the menu's effective reedline `InputMode` from the optional
 /// `input_mode` and legacy `only_buffer_difference` fields. The result drives
 /// both the reedline menu and `NuMenuCompleter`'s span math, so it must be
@@ -406,19 +289,16 @@ pub(crate) fn add_columnar_menu(
     columnar_menu = apply_output_mode(columnar_menu, menu, config)?;
 
     let completer = if let Some(closure) = &menu.source {
-        let menu_completer = NuMenuCompleter::new(
-            closure.block_id,
+        menu_with_source(
+            columnar_menu,
+            closure,
             span,
-            stack.captures_to_stack(closure.captures.clone()),
+            stack,
             engine_state,
             input_mode,
-        );
-        ReedlineMenu::WithCompleter {
-            menu: Box::new(columnar_menu),
-            completer: Box::new(menu_completer),
-        }
+        )
     } else {
-        ReedlineMenu::EngineCompleter(Box::new(columnar_menu))
+        ReedlineMenu::EngineCompleter(Box::new(SourcedMenu::abandoning(columnar_menu)))
     };
 
     Ok(line_editor.with_menu(completer))
@@ -463,17 +343,7 @@ pub(crate) fn add_list_menu(
     list_menu = apply_output_mode(list_menu, menu, &config)?;
 
     let completer = if let Some(closure) = &menu.source {
-        let menu_completer = NuMenuCompleter::new(
-            closure.block_id,
-            span,
-            stack.captures_to_stack(closure.captures.clone()),
-            engine_state,
-            input_mode,
-        );
-        ReedlineMenu::WithCompleter {
-            menu: Box::new(list_menu),
-            completer: Box::new(menu_completer),
-        }
+        menu_with_source(list_menu, closure, span, stack, engine_state, input_mode)
     } else {
         ReedlineMenu::HistoryMenu(Box::new(list_menu))
     };
@@ -638,19 +508,9 @@ pub(crate) fn add_ide_menu(
     ide_menu = apply_output_mode(ide_menu, menu, &config)?;
 
     let completer = if let Some(closure) = &menu.source {
-        let menu_completer = NuMenuCompleter::new(
-            closure.block_id,
-            span,
-            stack.captures_to_stack(closure.captures.clone()),
-            engine_state,
-            input_mode,
-        );
-        ReedlineMenu::WithCompleter {
-            menu: Box::new(ide_menu),
-            completer: Box::new(menu_completer),
-        }
+        menu_with_source(ide_menu, closure, span, stack, engine_state, input_mode)
     } else {
-        ReedlineMenu::EngineCompleter(Box::new(ide_menu))
+        ReedlineMenu::EngineCompleter(Box::new(SourcedMenu::abandoning(ide_menu)))
     };
 
     Ok(line_editor.with_menu(completer))
@@ -720,17 +580,14 @@ pub(crate) fn add_description_menu(
     description_menu = apply_output_mode(description_menu, menu, &config)?;
 
     let completer = if let Some(closure) = &menu.source {
-        let menu_completer = NuMenuCompleter::new(
-            closure.block_id,
+        menu_with_source(
+            description_menu,
+            closure,
             span,
-            stack.captures_to_stack(closure.captures.clone()),
+            stack,
             engine_state,
             input_mode,
-        );
-        ReedlineMenu::WithCompleter {
-            menu: Box::new(description_menu),
-            completer: Box::new(menu_completer),
-        }
+        )
     } else {
         let menu_completer = NuHelpCompleter::new(engine_state, config);
         ReedlineMenu::WithCompleter {
@@ -742,145 +599,101 @@ pub(crate) fn add_description_menu(
     Ok(line_editor.with_menu(completer))
 }
 
-fn add_menu_keybindings(keybindings: &mut Keybindings) {
-    // Completer menu keybindings
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Tab,
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu("completion_menu".to_string()),
-            ReedlineEvent::MenuNext,
-            ReedlineEvent::Edit(vec![EditCommand::Complete]),
-        ]),
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::CONTROL,
-        KeyCode::Char(' '),
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu("ide_completion_menu".to_string()),
-            ReedlineEvent::MenuNext,
-            ReedlineEvent::Edit(vec![EditCommand::Complete]),
-        ]),
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::SHIFT,
-        KeyCode::BackTab,
-        ReedlineEvent::MenuPrevious,
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::CONTROL,
-        KeyCode::Char('r'),
-        ReedlineEvent::Menu("history_menu".to_string()),
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::CONTROL,
-        KeyCode::Char('x'),
-        ReedlineEvent::MenuPageNext,
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::CONTROL,
-        KeyCode::Char('z'),
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::MenuPagePrevious,
-            ReedlineEvent::Edit(vec![EditCommand::Undo]),
-        ]),
-    );
-
-    // Help menu keybinding
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::F(1),
-        ReedlineEvent::Menu("help_menu".to_string()),
-    );
-
-    keybindings.add_binding(
-        KeyModifiers::CONTROL,
-        KeyCode::Char('q'),
-        ReedlineEvent::SearchHistory,
-    );
-}
-
 pub enum KeybindingsMode {
     Emacs(Keybindings),
     Vi {
         insert_keybindings: Keybindings,
         normal_keybindings: Keybindings,
+        visual_keybindings: Keybindings,
     },
+    Helix {
+        insert_keybindings: Keybindings,
+        normal_keybindings: Keybindings,
+        select_keybindings: Keybindings,
+    },
+}
+
+/// The per-mode keybinding tables a parsed `$env.config.keybindings` entry can
+/// target, seeded with reedline's defaults.
+struct KeybindingTables {
+    emacs: Keybindings,
+    vi_insert: Keybindings,
+    vi_normal: Keybindings,
+    vi_visual: Keybindings,
+    helix_insert: Keybindings,
+    helix_normal: Keybindings,
+    helix_select: Keybindings,
 }
 
 pub(crate) fn create_keybindings(config: &Config) -> Result<KeybindingsMode, ShellError> {
     let parsed_keybindings = &config.keybindings;
 
-    let mut emacs_keybindings = default_emacs_keybindings();
-    let mut insert_keybindings = default_vi_insert_keybindings();
-    let mut normal_keybindings = default_vi_normal_keybindings();
+    // Reedline base maps stay library-owned; Nushell menu bindings live on
+    // `config.keybindings` (including defaults from `Config::default()`).
+    let mut tables = KeybindingTables {
+        emacs: default_emacs_keybindings(),
+        vi_insert: default_vi_insert_keybindings(),
+        vi_normal: default_vi_normal_keybindings(),
+        vi_visual: default_vi_visual_keybindings(),
+        helix_insert: default_helix_insert_keybindings(),
+        helix_normal: default_helix_normal_keybindings(),
+        helix_select: default_helix_select_keybindings(),
+    };
 
-    match config.edit_mode {
-        EditBindings::Emacs => {
-            add_menu_keybindings(&mut emacs_keybindings);
-        }
-        EditBindings::Vi => {
-            add_menu_keybindings(&mut insert_keybindings);
-            add_menu_keybindings(&mut normal_keybindings);
-        }
-    }
     for keybinding in parsed_keybindings {
-        add_keybinding(
-            &keybinding.mode,
-            keybinding,
-            config,
-            &mut emacs_keybindings,
-            &mut insert_keybindings,
-            &mut normal_keybindings,
-        )?
+        add_keybinding(&keybinding.mode, keybinding, config, &mut tables)?
     }
 
     match config.edit_mode {
-        EditBindings::Emacs => Ok(KeybindingsMode::Emacs(emacs_keybindings)),
+        EditBindings::Emacs => Ok(KeybindingsMode::Emacs(tables.emacs)),
         EditBindings::Vi => Ok(KeybindingsMode::Vi {
-            insert_keybindings,
-            normal_keybindings,
+            insert_keybindings: tables.vi_insert,
+            normal_keybindings: tables.vi_normal,
+            visual_keybindings: tables.vi_visual,
+        }),
+        EditBindings::Helix => Ok(KeybindingsMode::Helix {
+            insert_keybindings: tables.helix_insert,
+            normal_keybindings: tables.helix_normal,
+            select_keybindings: tables.helix_select,
         }),
     }
 }
+
+const VALID_KEYBINDING_MODES: &str = "'emacs', 'vi_insert', 'vi_normal', 'vi_visual', 'helix_insert', 'helix_normal', or 'helix_select'";
 
 fn add_keybinding(
     mode: &Value,
     keybinding: &ParsedKeybinding,
     config: &Config,
-    emacs_keybindings: &mut Keybindings,
-    insert_keybindings: &mut Keybindings,
-    normal_keybindings: &mut Keybindings,
+    tables: &mut KeybindingTables,
 ) -> Result<(), ShellError> {
     use PromptEditModeDiscriminants as PEMD;
     let span = mode.span();
     match &mode {
         // When updating this implementation, also update `display_edit_mode` function
         Value::String { val, .. } => match PEMD::from_str(val) {
-            Ok(PEMD::Emacs) => add_parsed_keybinding(emacs_keybindings, keybinding, config),
-            Ok(PEMD::ViInsert) => add_parsed_keybinding(insert_keybindings, keybinding, config),
-            Ok(PEMD::ViNormal) => add_parsed_keybinding(normal_keybindings, keybinding, config),
+            Ok(PEMD::Emacs) => add_parsed_keybinding(&mut tables.emacs, keybinding, config),
+            Ok(PEMD::ViInsert) => add_parsed_keybinding(&mut tables.vi_insert, keybinding, config),
+            Ok(PEMD::ViNormal) => add_parsed_keybinding(&mut tables.vi_normal, keybinding, config),
+            Ok(PEMD::ViVisual) => add_parsed_keybinding(&mut tables.vi_visual, keybinding, config),
+            Ok(PEMD::HelixInsert) => {
+                add_parsed_keybinding(&mut tables.helix_insert, keybinding, config)
+            }
+            Ok(PEMD::HelixNormal) => {
+                add_parsed_keybinding(&mut tables.helix_normal, keybinding, config)
+            }
+            Ok(PEMD::HelixSelect) => {
+                add_parsed_keybinding(&mut tables.helix_select, keybinding, config)
+            }
             Ok(PEMD::Default | PEMD::Custom) | Err(_) => Err(ShellError::InvalidValue {
-                valid: "'emacs', 'vi_insert', or 'vi_normal'".into(),
+                valid: VALID_KEYBINDING_MODES.into(),
                 actual: format!("'{val}'"),
                 span,
             }),
         },
         Value::List { vals, .. } => {
             for inner_mode in vals {
-                add_keybinding(
-                    inner_mode,
-                    keybinding,
-                    config,
-                    emacs_keybindings,
-                    insert_keybindings,
-                    normal_keybindings,
-                )?
+                add_keybinding(inner_mode, keybinding, config, tables)?
             }
 
             Ok(())
@@ -899,6 +712,10 @@ pub(crate) fn display_edit_mode(mode: PromptEditModeDiscriminants) -> Option<Str
         PromptEditModeDiscriminants::Emacs => Some("emacs".into()),
         PromptEditModeDiscriminants::ViNormal => Some("vi_normal".into()),
         PromptEditModeDiscriminants::ViInsert => Some("vi_insert".into()),
+        PromptEditModeDiscriminants::ViVisual => Some("vi_visual".into()),
+        PromptEditModeDiscriminants::HelixNormal => Some("helix_normal".into()),
+        PromptEditModeDiscriminants::HelixInsert => Some("helix_insert".into()),
+        PromptEditModeDiscriminants::HelixSelect => Some("helix_select".into()),
         PromptEditModeDiscriminants::Default | PromptEditModeDiscriminants::Custom => None,
     }
 }
@@ -1144,6 +961,7 @@ fn event_from_record(
             let menu = extract_value("name", record, span)?;
             ReedlineEvent::Menu(menu.to_expanded_string("", config))
         }
+        Ok(RED::MenuAccept) => ReedlineEvent::MenuAccept,
         Ok(RED::MenuNext) => ReedlineEvent::MenuNext,
         Ok(RED::MenuPrevious) => ReedlineEvent::MenuPrevious,
         Ok(RED::MenuUp) => ReedlineEvent::MenuUp,
@@ -1157,9 +975,20 @@ fn event_from_record(
             ReedlineEvent::ExecuteHostCommand(cmd.to_expanded_string("", config))
         }
         Ok(RED::OpenEditor) => ReedlineEvent::OpenEditor,
-        Ok(RED::ViChangeMode) => {
+        Ok(RED::SwitchMode) => {
             let mode = extract_value("mode", record, span)?;
-            ReedlineEvent::ViChangeMode(mode.as_str()?.to_owned())
+            ReedlineEvent::SwitchMode(switch_mode_target(mode)?)
+        }
+        // Gone from reedline, lowered onto `SwitchMode` so existing configs
+        // keep working. Each names a state of its own editor, so under the
+        // other editor it stays inapplicable, as it always did.
+        Err(_) if name.eq_ignore_ascii_case("ViChangeMode") => {
+            let mode = extract_value("mode", record, span)?;
+            ReedlineEvent::SwitchMode(PromptEditMode::Vi(vi_change_mode_target(mode)?))
+        }
+        Err(_) if name.eq_ignore_ascii_case("HelixChangeMode") => {
+            let mode = extract_value("mode", record, span)?;
+            ReedlineEvent::SwitchMode(PromptEditMode::Helix(helix_change_mode_target(mode)?))
         }
         // Non-sensical for user configuration:
         //
@@ -1181,6 +1010,61 @@ fn event_from_record(
     };
 
     Ok(event)
+}
+
+/// The target of a `SwitchMode` event: the same names `mode` takes on a
+/// keybinding, one editor state each.
+fn switch_mode_target(mode: &Value) -> Result<PromptEditMode, ShellError> {
+    use PromptEditModeDiscriminants as PEMD;
+    let name = mode.as_str()?;
+    let target = match PEMD::from_str(name) {
+        Ok(PEMD::Emacs) => PromptEditMode::Emacs,
+        Ok(PEMD::ViInsert) => PromptEditMode::Vi(PromptViMode::Insert),
+        Ok(PEMD::ViNormal) => PromptEditMode::Vi(PromptViMode::Normal),
+        Ok(PEMD::ViVisual) => PromptEditMode::Vi(PromptViMode::Visual),
+        Ok(PEMD::HelixInsert) => PromptEditMode::Helix(PromptHelixMode::Insert),
+        Ok(PEMD::HelixNormal) => PromptEditMode::Helix(PromptHelixMode::Normal),
+        Ok(PEMD::HelixSelect) => PromptEditMode::Helix(PromptHelixMode::Select),
+        Ok(PEMD::Default | PEMD::Custom) | Err(_) => {
+            return Err(ShellError::InvalidValue {
+                valid: VALID_KEYBINDING_MODES.into(),
+                actual: format!("'{name}'"),
+                span: mode.span(),
+            });
+        }
+    };
+    Ok(target)
+}
+
+/// `ViChangeMode mode: <string>` named the vi state without its `vi_` prefix.
+fn vi_change_mode_target(mode: &Value) -> Result<PromptViMode, ShellError> {
+    let name = mode.as_str()?;
+    match name.to_ascii_lowercase().as_str() {
+        "insert" => Ok(PromptViMode::Insert),
+        "normal" => Ok(PromptViMode::Normal),
+        "visual" => Ok(PromptViMode::Visual),
+        _ => Err(ShellError::InvalidValue {
+            valid: "'insert', 'normal', or 'visual'".into(),
+            actual: format!("'{name}'"),
+            span: mode.span(),
+        }),
+    }
+}
+
+/// `HelixChangeMode mode: <string>` named the helix state without its
+/// `helix_` prefix.
+fn helix_change_mode_target(mode: &Value) -> Result<PromptHelixMode, ShellError> {
+    let name = mode.as_str()?;
+    match name.to_ascii_lowercase().as_str() {
+        "insert" => Ok(PromptHelixMode::Insert),
+        "normal" => Ok(PromptHelixMode::Normal),
+        "select" => Ok(PromptHelixMode::Select),
+        _ => Err(ShellError::InvalidValue {
+            valid: "'insert', 'normal', or 'select'".into(),
+            actual: format!("'{name}'"),
+            span: mode.span(),
+        }),
+    }
 }
 
 // This is displayed in `keybindings list` command
@@ -1212,6 +1096,7 @@ pub(crate) fn display_reedline_event(event: ReedlineEventDiscriminants) -> Optio
         RED::Multiple => "event: { send: list<event> }",
         RED::UntilFound => "event: { until: list<event> }",
         RED::Menu => "Menu name: <string>",
+        RED::MenuAccept => "MenuAccept",
         RED::MenuNext => "MenuNext",
         RED::MenuPrevious => "MenuPrevious",
         RED::MenuUp => "MenuUp",
@@ -1222,7 +1107,7 @@ pub(crate) fn display_reedline_event(event: ReedlineEventDiscriminants) -> Optio
         RED::MenuPagePrevious => "MenuPagePrevious",
         RED::ExecuteHostCommand => "ExecuteHostCommand cmd: <string>",
         RED::OpenEditor => "OpenEditor",
-        RED::ViChangeMode => "ViChangeMode mode: <string>",
+        RED::SwitchMode => "SwitchMode mode: <string>",
         // Non-sensical for user configuration
         RED::Mouse | RED::Resize => return None,
     })
@@ -1337,6 +1222,13 @@ fn edit_from_record(
             let value = extract_value("value", record, span)?;
             EditCommand::InsertString(value.to_expanded_string("", config))
         }
+        Ok(ECD::InsertPair) => {
+            let value = extract_value("open", record, span)?;
+            let open = extract_char(value)?;
+            let value = extract_value("close", record, span)?;
+            let close = extract_char(value)?;
+            EditCommand::InsertPair { open, close }
+        }
         Ok(ECD::InsertNewline) => EditCommand::InsertNewline,
         Ok(ECD::InsertNewlineAbove) => EditCommand::InsertNewlineAbove,
         Ok(ECD::InsertNewlineBelow) => EditCommand::InsertNewlineBelow,
@@ -1346,7 +1238,15 @@ fn edit_from_record(
             EditCommand::ReplaceChar(char)
         }
         Ok(ECD::Backspace) => EditCommand::Backspace,
+        Ok(ECD::BackspacePair) => {
+            let value = extract_value("open", record, span)?;
+            let open = extract_char(value)?;
+            let value = extract_value("close", record, span)?;
+            let close = extract_char(value)?;
+            EditCommand::BackspacePair { open, close }
+        }
         Ok(ECD::Delete) => EditCommand::Delete,
+        Ok(ECD::CutCharLeft) => EditCommand::CutCharLeft,
         Ok(ECD::CutChar) => EditCommand::CutChar,
         Ok(ECD::BackspaceWord) => EditCommand::BackspaceWord,
         Ok(ECD::DeleteWord) => EditCommand::DeleteWord,
@@ -1437,8 +1337,15 @@ fn edit_from_record(
             EditCommand::MoveLeftBefore { c: char, select }
         }
         Ok(ECD::SelectAll) => EditCommand::SelectAll,
-        Ok(ECD::CutSelection) => EditCommand::CutSelection,
+        Ok(ECD::SelectLine) => EditCommand::SelectLine,
+        Ok(ECD::EraseSelection) => EditCommand::EraseSelection,
+        Ok(ECD::CutSelection) => EditCommand::CutSelection {
+            granularity: parse_granularity(record, config, span)?,
+        },
         Ok(ECD::CopySelection) => EditCommand::CopySelection,
+        Ok(ECD::LowercaseSelection) => EditCommand::LowercaseSelection,
+        Ok(ECD::UppercaseSelection) => EditCommand::UppercaseSelection,
+        Ok(ECD::SwitchcaseSelection) => EditCommand::SwitchcaseSelection,
         Ok(ECD::Paste) => EditCommand::Paste,
         Ok(ECD::CopyFromStart) => EditCommand::CopyFromStart,
         Ok(ECD::CopyFromStartLinewise) => EditCommand::CopyFromStartLinewise,
@@ -1521,6 +1428,7 @@ fn edit_from_record(
         // `Granularity`) parsed from the same record. See `parse_motion_target`.
         Ok(ECD::Move) => EditCommand::Move(parse_motion_target(record, config, span)?),
         Ok(ECD::Extend) => EditCommand::Extend(parse_motion_target(record, config, span)?),
+        Ok(ECD::Select) => EditCommand::Select(parse_motion_target(record, config, span)?),
         Ok(ECD::Erase) => EditCommand::Erase(parse_motion_target(record, config, span)?),
         Ok(ECD::Cut) => EditCommand::Cut {
             target: parse_motion_target(record, config, span)?,
@@ -1533,6 +1441,17 @@ fn edit_from_record(
         Ok(ECD::Change) => EditCommand::Change {
             target: parse_motion_target(record, config, span)?,
             granularity: parse_granularity(record, config, span)?,
+        },
+        Ok(ECD::CollapseSelection) => {
+            EditCommand::CollapseSelection(parse_direction(record, config, span)?)
+        }
+        Ok(ECD::PasteAtSelectionEdge) => EditCommand::PasteAtSelectionEdge {
+            direction: parse_direction(record, config, span)?,
+            count: extract_value("count", record, span)
+                .and_then(|value| value.as_int())
+                .ok()
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(1),
         },
         // `EditCommand::ReplaceChars` - Internal hack not sanely implementable as a
         // standalone binding
@@ -1573,12 +1492,15 @@ pub(crate) fn display_edit_command(edit: EditCommandDiscriminants) -> Option<&'s
         ECD::MoveLeftBefore => "MoveLeftBefore value: <char>, select?: <bool>",
         ECD::InsertChar => "InsertChar value: <char>",
         ECD::InsertString => "InsertString value: <string>",
+        ECD::InsertPair => "InsertPair open: <char>, close: <char>",
         ECD::InsertNewline => "InsertNewline",
         ECD::InsertNewlineAbove => "InsertNewlineAbove",
         ECD::InsertNewlineBelow => "InsertNewlineBelow",
         ECD::ReplaceChar => "ReplaceChar value: <char>",
         ECD::Backspace => "Backspace",
+        ECD::BackspacePair => "BackspacePair open: <char>, close: <char>",
         ECD::Delete => "Delete",
+        ECD::CutCharLeft => "CutCharLeft",
         ECD::CutChar => "CutChar",
         ECD::BackspaceWord => "BackspaceWord",
         ECD::DeleteWord => "DeleteWord",
@@ -1617,8 +1539,13 @@ pub(crate) fn display_edit_command(edit: EditCommandDiscriminants) -> Option<&'s
         ECD::CutLeftUntil => "CutLeftUntil value: <char>",
         ECD::CutLeftBefore => "CutLeftBefore value: <char>",
         ECD::SelectAll => "SelectAll",
-        ECD::CutSelection => "CutSelection",
+        ECD::SelectLine => "SelectLine",
+        ECD::EraseSelection => "EraseSelection",
+        ECD::CutSelection => "CutSelection granularity?: <string>",
         ECD::CopySelection => "CopySelection",
+        ECD::LowercaseSelection => "LowercaseSelection",
+        ECD::UppercaseSelection => "UppercaseSelection",
+        ECD::SwitchcaseSelection => "SwitchcaseSelection",
         ECD::Paste => "Paste",
         ECD::CopyFromStart => "CopyFromStart",
         ECD::CopyFromStartLinewise => "CopyFromStartLinewise",
@@ -1659,6 +1586,9 @@ pub(crate) fn display_edit_command(edit: EditCommandDiscriminants) -> Option<&'s
         ECD::Extend => {
             "Extend motion: <string>, direction: <string>, word_kind?: <string>, edge?: <string>, char?: <char>, stop?: <string>"
         }
+        ECD::Select => {
+            "Select motion: <string>, direction: <string>, word_kind?: <string>, edge?: <string>, char?: <char>, stop?: <string>"
+        }
         ECD::Erase => {
             "Erase motion: <string>, direction: <string>, word_kind?: <string>, edge?: <string>, char?: <char>, stop?: <string>"
         }
@@ -1671,6 +1601,8 @@ pub(crate) fn display_edit_command(edit: EditCommandDiscriminants) -> Option<&'s
         ECD::Change => {
             "Change motion: <string>, direction: <string>, word_kind?: <string>, edge?: <string>, char?: <char>, stop?: <string>, granularity?: <string>"
         }
+        ECD::CollapseSelection => "CollapseSelection direction: <string>",
+        ECD::PasteAtSelectionEdge => "PasteAtSelectionEdge direction: <string>, count?: <int>",
         ECD::ReplaceChars => return None,
     })
 }
@@ -2208,6 +2140,250 @@ mod test {
             Some(ReedlineEvent::Edit(vec![EditCommand::MoveLeft {
                 select: true
             }]))
+        );
+    }
+
+    #[test]
+    fn default_config_keybindings_apply() {
+        // Nushell menu keybindings on Config::default must parse as valid reedline events.
+        let config = Config::default();
+        assert!(!config.keybindings.is_empty());
+        assert!(!config.menus.is_empty());
+        create_keybindings(&config).expect("default keybindings should apply cleanly");
+    }
+
+    #[test]
+    fn default_config_binds_menu_keys_in_helix_mode() {
+        // The Nushell menu keybindings are mode-scoped; helix missing from that
+        // list left Tab and the other menu keys unbound in both helix tables.
+        let config = Config {
+            edit_mode: EditBindings::Helix,
+            ..Default::default()
+        };
+        let KeybindingsMode::Helix {
+            insert_keybindings,
+            normal_keybindings,
+            select_keybindings,
+        } = create_keybindings(&config).expect("default keybindings should apply cleanly")
+        else {
+            panic!("`edit_mode: helix` should produce helix keybindings");
+        };
+
+        for (table, keybindings) in [
+            ("insert", insert_keybindings),
+            ("normal", normal_keybindings),
+            ("select", select_keybindings),
+        ] {
+            for (name, modifier, keycode) in [
+                ("completion_menu", KeyModifiers::NONE, KeyCode::Tab),
+                ("completion_previous", KeyModifiers::SHIFT, KeyCode::BackTab),
+                ("history_menu", KeyModifiers::CONTROL, KeyCode::Char('r')),
+                ("help_menu", KeyModifiers::NONE, KeyCode::F(1)),
+            ] {
+                assert!(
+                    keybindings.find_binding(modifier, keycode).is_some(),
+                    "`{name}` should be bound in the helix {table} table"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helix_select_keybindings_land_in_their_own_table() {
+        use nu_protocol::ParsedKeybinding;
+
+        // `mode: helix_select` targets the select table, not the normal one it
+        // used to alias onto, and the select table keeps reedline's extending
+        // arrow defaults underneath.
+        let keybinding = ParsedKeybinding {
+            name: Some(Value::test_string("select_only")),
+            modifier: Value::test_string("control"),
+            keycode: Value::test_string("char_t"),
+            event: Value::test_record(record! {
+                "send" => Value::test_string("clearscreen"),
+            }),
+            mode: Value::test_string("helix_select"),
+        };
+        let mut config = Config {
+            edit_mode: EditBindings::Helix,
+            ..Default::default()
+        };
+        config.keybindings.push(keybinding);
+
+        let KeybindingsMode::Helix {
+            normal_keybindings,
+            select_keybindings,
+            ..
+        } = create_keybindings(&config).expect("keybindings should apply cleanly")
+        else {
+            panic!("`edit_mode: helix` should produce helix keybindings");
+        };
+
+        assert_eq!(
+            select_keybindings.find_binding(KeyModifiers::CONTROL, KeyCode::Char('t')),
+            Some(ReedlineEvent::ClearScreen),
+        );
+        assert_eq!(
+            normal_keybindings.find_binding(KeyModifiers::CONTROL, KeyCode::Char('t')),
+            None,
+            "a `helix_select` binding must not leak into the normal table"
+        );
+        // Spot-check the reedline select default underneath: Right extends.
+        assert!(
+            matches!(
+                select_keybindings.find_binding(KeyModifiers::NONE, KeyCode::Right),
+                Some(ReedlineEvent::Edit(_))
+            ),
+            "the select table should keep reedline's extending arrow defaults"
+        );
+    }
+
+    #[test]
+    fn test_switch_mode_event() {
+        let config = Config::default();
+        for (name, target) in [
+            ("emacs", PromptEditMode::Emacs),
+            ("vi_insert", PromptEditMode::Vi(PromptViMode::Insert)),
+            ("vi_normal", PromptEditMode::Vi(PromptViMode::Normal)),
+            ("vi_visual", PromptEditMode::Vi(PromptViMode::Visual)),
+            (
+                "helix_insert",
+                PromptEditMode::Helix(PromptHelixMode::Insert),
+            ),
+            (
+                "helix_normal",
+                PromptEditMode::Helix(PromptHelixMode::Normal),
+            ),
+            (
+                "helix_select",
+                PromptEditMode::Helix(PromptHelixMode::Select),
+            ),
+        ] {
+            let event = Value::test_record(record! {
+                "send" => Value::test_string("SwitchMode"),
+                "mode" => Value::test_string(name),
+            });
+            assert_eq!(
+                parse_event(&event, &config).unwrap(),
+                Some(ReedlineEvent::SwitchMode(target)),
+                "`mode: {name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_change_mode_events_lower_onto_switch_mode() {
+        // The names reedline dropped still parse, and keep their own
+        // vocabulary: the state without the editor prefix.
+        let config = Config::default();
+        for (send, mode, target) in [
+            (
+                "ViChangeMode",
+                "normal",
+                PromptEditMode::Vi(PromptViMode::Normal),
+            ),
+            (
+                "ViChangeMode",
+                "insert",
+                PromptEditMode::Vi(PromptViMode::Insert),
+            ),
+            (
+                "vichangemode",
+                "visual",
+                PromptEditMode::Vi(PromptViMode::Visual),
+            ),
+            (
+                "HelixChangeMode",
+                "normal",
+                PromptEditMode::Helix(PromptHelixMode::Normal),
+            ),
+            (
+                "HelixChangeMode",
+                "select",
+                PromptEditMode::Helix(PromptHelixMode::Select),
+            ),
+        ] {
+            let event = Value::test_record(record! {
+                "send" => Value::test_string(send),
+                "mode" => Value::test_string(mode),
+            });
+            assert_eq!(
+                parse_event(&event, &config).unwrap(),
+                Some(ReedlineEvent::SwitchMode(target)),
+                "`send: {send}, mode: {mode}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_switch_mode_rejects_an_unknown_mode() {
+        let config = Config::default();
+        for (send, mode) in [
+            ("SwitchMode", "normal"),
+            ("SwitchMode", "vi_nrmal"),
+            ("ViChangeMode", "select"),
+            ("HelixChangeMode", "visual"),
+        ] {
+            let event = Value::test_record(record! {
+                "send" => Value::test_string(send),
+                "mode" => Value::test_string(mode),
+            });
+            assert!(
+                matches!(
+                    parse_event(&event, &config),
+                    Err(ShellError::InvalidValue { .. })
+                ),
+                "`send: {send}, mode: {mode}` should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn vi_visual_keybindings_land_in_their_own_table() {
+        use nu_protocol::ParsedKeybinding;
+
+        // `mode: vi_visual` targets the visual table, which used to be the
+        // normal table itself, and the visual table keeps reedline's
+        // extending arrow defaults underneath.
+        let keybinding = ParsedKeybinding {
+            name: Some(Value::test_string("visual_only")),
+            modifier: Value::test_string("control"),
+            keycode: Value::test_string("char_t"),
+            event: Value::test_record(record! {
+                "send" => Value::test_string("clearscreen"),
+            }),
+            mode: Value::test_string("vi_visual"),
+        };
+        let mut config = Config {
+            edit_mode: EditBindings::Vi,
+            ..Default::default()
+        };
+        config.keybindings.push(keybinding);
+
+        let KeybindingsMode::Vi {
+            normal_keybindings,
+            visual_keybindings,
+            ..
+        } = create_keybindings(&config).expect("keybindings should apply cleanly")
+        else {
+            panic!("`edit_mode: vi` should produce vi keybindings");
+        };
+
+        assert_eq!(
+            visual_keybindings.find_binding(KeyModifiers::CONTROL, KeyCode::Char('t')),
+            Some(ReedlineEvent::ClearScreen),
+        );
+        assert_eq!(
+            normal_keybindings.find_binding(KeyModifiers::CONTROL, KeyCode::Char('t')),
+            None,
+            "a `vi_visual` binding must not leak into the normal table"
+        );
+        assert!(
+            matches!(
+                visual_keybindings.find_binding(KeyModifiers::NONE, KeyCode::Right),
+                Some(ReedlineEvent::Edit(_))
+            ),
+            "the visual table should keep reedline's extending arrow defaults"
         );
     }
 }

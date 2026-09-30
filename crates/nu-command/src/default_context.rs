@@ -347,7 +347,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             ToMsgpack,
             ToMsgpackz,
             ToNuon,
-            ToText,
+            TO_TEXT,
+            TO_TXT,
             ToToml,
             ToTsv,
             ToKdl,
@@ -519,6 +520,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Hash,
             HashMd5::default(),
             HashSha256::default(),
+            HashSha512::default(),
         };
 
         // Experimental

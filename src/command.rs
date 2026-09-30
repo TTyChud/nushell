@@ -1,16 +1,16 @@
-use crate::test_bins;
 use lexopt::prelude::*;
 use nu_experimental as experimental_options;
 use nu_parser::escape_for_script_arg;
 use nu_protocol::{
     LabeledError, ShellError, Span, Spanned, Value, config::TableMode, did_you_mean,
 };
-use nu_utils::stdout_write_all_and_flush;
+use nu_utils::{stdout_write_all_and_flush, strip_ansi_string_likely};
 #[cfg(feature = "plugin")]
 use std::path::Path;
 use std::{
     ffi::OsString,
     fmt::{self, Write},
+    io::IsTerminal,
 };
 
 const HELP_SECTION_COLOR: &str = "\x1b[32m";
@@ -48,24 +48,6 @@ const LOG_LEVEL_VALUES: &[&str] = &["error", "warn", "info", "debug", "trace", "
 const LOG_TARGET_VALUES: &[&str] = &["stdout", "stderr", "mixed", "file"];
 #[cfg(feature = "mcp")]
 const MCP_TRANSPORT_VALUES: &[&str] = &["stdio", "http"];
-const TEST_BIN_VALUES: &[&str] = &[
-    "echo_env",
-    "echo_env_stderr",
-    "echo_env_stderr_fail",
-    "echo_env_mixed",
-    "cococo",
-    "meow",
-    "meowb",
-    "relay",
-    "iecho",
-    "fail",
-    "nonu",
-    "chop",
-    "repeater",
-    "repeat_bytes",
-    "nu_repl",
-    "input_bytes_length",
-];
 
 // Parsed CLI output with nushell flags and script information.
 #[derive(Clone, Debug)]
@@ -317,14 +299,6 @@ const CLI_FLAGS: &[CliFlag] = &[
         "nu --stdin -c \"print $in\"",
     ),
     CliFlag::value(
-        "testbin",
-        None,
-        ValueHint::String,
-        "run an internal test binary (see available bins below)",
-        CliCategory::Startup,
-        "nu --testbin cococo",
-    ),
-    CliFlag::value(
         "experimental-options",
         None,
         ValueHint::ListString,
@@ -339,6 +313,14 @@ const CLI_FLAGS: &[CliFlag] = &[
         "start nu's language server protocol",
         CliCategory::Ide,
         "nu --lsp",
+    ),
+    #[cfg(feature = "dap")]
+    CliFlag::switch(
+        "dap",
+        None,
+        "start nu's debug adapter protocol server (over stdio)",
+        CliCategory::Ide,
+        "nu --dap",
     ),
     CliFlag::value(
         "ide-goto-def",
@@ -423,6 +405,15 @@ const CLI_FLAGS: &[CliFlag] = &[
         CliCategory::Startup,
         "nu --mcp --mcp-transport http --mcp-port 3000",
     ),
+    #[cfg(feature = "mcp")]
+    CliFlag::value(
+        "mcp-host",
+        None,
+        ValueHint::String,
+        "host for MCP HTTP transhost (default 127.0.0.1)",
+        CliCategory::Startup,
+        "nu --mcp --mcp-transhost http --mcp-host 0.0.0.0",
+    ),
 ];
 
 // Container for parsed CLI values before conversion to NushellCliArgs.
@@ -432,7 +423,6 @@ struct CliValues {
     login_shell: Option<Spanned<String>>,
     interactive_shell: Option<Spanned<String>>,
     commands: Option<Spanned<String>>,
-    testbin: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
     plugin_file: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
@@ -455,6 +445,8 @@ struct CliValues {
     include_path: Option<Spanned<String>>,
     #[cfg(feature = "lsp")]
     lsp: bool,
+    #[cfg(feature = "dap")]
+    dap: bool,
     ide_goto_def: Option<Value>,
     ide_hover: Option<Value>,
     ide_complete: Option<Value>,
@@ -467,6 +459,8 @@ struct CliValues {
     mcp_transport: Option<Spanned<String>>,
     #[cfg(feature = "mcp")]
     mcp_port: Option<u16>,
+    #[cfg(feature = "mcp")]
+    mcp_host: Option<String>,
 }
 
 // Error type for CLI parsing with optional help text.
@@ -544,9 +538,25 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
     }
 
     while let Some(arg) = parser.next().map_err(map_lexopt_error)? {
+        let mut consume_remaining_args = |parser: &mut lexopt::Parser| {
+            let rest = parser
+                .raw_args()
+                .map_err(map_lexopt_error)?
+                .map(|arg| arg.to_string_lossy().to_string())
+                .map(|arg| escape_for_script_arg(&arg))
+                .collect::<Vec<_>>();
+            args_to_script.extend(rest);
+            Ok(())
+        };
+
         match arg {
             Short('h') | Long("help") => {
                 let help = cli_help_text();
+                let help = if std::io::stdout().is_terminal() {
+                    help
+                } else {
+                    strip_ansi_string_likely(help)
+                };
                 let _ = std::panic::catch_unwind(move || stdout_write_all_and_flush(help));
                 std::process::exit(0);
             }
@@ -562,6 +572,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             Short('c') | Long("commands") => {
                 let value = parse_string_value(&mut parser, "commands")?;
                 cli.commands = Some(spanned_value(value));
+                consume_remaining_args(&mut parser)?;
+                break;
             }
             Short('e') | Long("execute") => {
                 let value = parse_string_value(&mut parser, "execute")?;
@@ -655,11 +667,6 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                     .extend(parsed.into_iter().map(spanned_value));
             }
             Long("stdin") => cli.redirect_stdin = Some(spanned_true()),
-            Long("testbin") => {
-                let normalized =
-                    parse_validated_option(&mut parser, "testbin", TEST_BIN_VALUES, "test bin")?;
-                cli.testbin = Some(spanned_value(normalized));
-            }
             Long("experimental-options") => {
                 let values = parse_experimental_options(&mut parser)?;
                 cli.experimental_options
@@ -668,6 +675,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             }
             #[cfg(feature = "lsp")]
             Long("lsp") => cli.lsp = true,
+            #[cfg(feature = "dap")]
+            Long("dap") => cli.dap = true,
             Long("ide-goto-def") => {
                 cli.ide_goto_def = Some(parse_ide_int_option(&mut parser, "ide-goto-def")?)
             }
@@ -743,15 +752,10 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
                     CliError::new("Invalid argument", "argument is not valid unicode")
                         .with_help("Use UTF-8 arguments when calling nushell.")
                 })?;
-                if script_name.is_empty() {
+
+                if script_name.is_empty() && cli.commands.is_none() {
                     script_name = value;
-                    let rest = parser
-                        .raw_args()
-                        .map_err(map_lexopt_error)?
-                        .map(|arg| arg.to_string_lossy().to_string())
-                        .map(|arg| escape_for_script_arg(&arg))
-                        .collect::<Vec<_>>();
-                    args_to_script.extend(rest);
+                    consume_remaining_args(&mut parser)?;
                     break;
                 } else {
                     args_to_script.push(escape_for_script_arg(&value));
@@ -768,7 +772,6 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             login_shell: cli.login_shell,
             interactive_shell: cli.interactive_shell,
             commands: cli.commands,
-            testbin: cli.testbin,
             #[cfg(feature = "plugin")]
             plugin_file: cli.plugin_file,
             #[cfg(feature = "plugin")]
@@ -791,6 +794,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             include_path: cli.include_path,
             #[cfg(feature = "lsp")]
             lsp: cli.lsp,
+            #[cfg(feature = "dap")]
+            dap: cli.dap,
             ide_goto_def: cli.ide_goto_def,
             ide_hover: cli.ide_hover,
             ide_complete: cli.ide_complete,
@@ -803,6 +808,8 @@ pub(crate) fn parse_cli_args(args: Vec<OsString>) -> Result<ParsedCli, CliError>
             mcp_transport: cli.mcp_transport,
             #[cfg(feature = "mcp")]
             mcp_port: cli.mcp_port,
+            #[cfg(feature = "mcp")]
+            mcp_host: cli.mcp_host,
         },
         script_name,
         args_to_script,
@@ -1108,7 +1115,6 @@ fn missing_value_help(option: &str) -> String {
     match option {
         "-m" | "--table-mode" => format!("Valid table modes: {}", TABLE_MODE_VALUES.join(", ")),
         "--error-style" => format!("Valid error styles: {}", ERROR_STYLE_VALUES.join(", ")),
-        "--testbin" => format!("Valid test bins: {}", TEST_BIN_VALUES.join(", ")),
         "--log-level" | "--log-include" | "--log-exclude" => {
             format!("Valid log levels: {}", LOG_LEVEL_VALUES.join(", "))
         }
@@ -1234,7 +1240,6 @@ fn prevalidate_short_groups_before_lexopt(args: &[OsString]) -> Result<(), CliEr
             || arg == "--ide-hover"
             || arg == "--ide-complete"
             || arg == "--include-path"
-            || arg == "--testbin"
         {
             skip_next = true;
             i += 1;
@@ -1400,17 +1405,6 @@ fn cli_help_text() -> String {
                 flag.example
             )
             .expect("writing to a String is infallible");
-
-            // For the --testbin option we augment the static description with a dynamically generated list of the available binaries
-            // and their individual help strings
-            if flag.long == "testbin" {
-                writeln!(
-                    output,
-                    "      {HELP_DESC_COLOR}Available test bins:{RESET_COLOR}"
-                )
-                .expect("writing to a String is infallible");
-                output.push_str(&test_bins::help_list());
-            }
         }
     }
     output
@@ -1452,7 +1446,6 @@ pub(crate) struct NushellCliArgs {
     pub(crate) login_shell: Option<Spanned<String>>,
     pub(crate) interactive_shell: Option<Spanned<String>>,
     pub(crate) commands: Option<Spanned<String>>,
-    pub(crate) testbin: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
     pub(crate) plugin_file: Option<Spanned<String>>,
     #[cfg(feature = "plugin")]
@@ -1475,6 +1468,8 @@ pub(crate) struct NushellCliArgs {
     pub(crate) include_path: Option<Spanned<String>>,
     #[cfg(feature = "lsp")]
     pub(crate) lsp: bool,
+    #[cfg(feature = "dap")]
+    pub(crate) dap: bool,
     pub(crate) ide_goto_def: Option<Value>,
     pub(crate) ide_hover: Option<Value>,
     pub(crate) ide_complete: Option<Value>,
@@ -1487,30 +1482,14 @@ pub(crate) struct NushellCliArgs {
     pub(crate) mcp_transport: Option<Spanned<String>>,
     #[cfg(feature = "mcp")]
     pub(crate) mcp_port: Option<u16>,
+    #[cfg(feature = "mcp")]
+    pub(crate) mcp_host: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_bins;
     use std::ffi::OsString;
-
-    #[test]
-    fn cli_help_includes_testbin_list() {
-        let help = cli_help_text();
-        // the description for the testbin flag should be present
-        assert!(help.contains("--testbin"));
-
-        // there should be an entry for at least one known bin
-        assert!(help.contains("echo_env"));
-
-        // ensure the dynamic list from test_bins::help_list is embedded
-        let list = test_bins::help_list();
-        assert!(help.contains(list.trim()));
-
-        // colored subcommand names should use the new bright-cyan code
-        assert!(help.contains(HELP_SUBCMD_COLOR));
-    }
 
     #[test]
     fn test_log_file_parsing() {

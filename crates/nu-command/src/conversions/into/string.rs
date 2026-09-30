@@ -40,6 +40,8 @@ impl Command for IntoString {
                 (Type::Duration, Type::String),
                 (Type::CellPath, Type::String),
                 (Type::Range, Type::String),
+                (Type::custom("semver"), Type::String),
+                (Type::custom("semver-range"), Type::String),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::String)),
@@ -147,6 +149,11 @@ impl Command for IntoString {
                 example: "$.name | into string",
                 result: Some(Value::test_string("$.name")),
             },
+            Example {
+                description: "convert semver to string.",
+                example: "'1.2.3' | into semver | into string",
+                result: Some(Value::test_string("1.2.3")),
+            },
         ]
     }
 }
@@ -232,7 +239,7 @@ fn action(input: &Value, args: &Arguments, span: Span) -> Value {
                 Value::string(input.to_expanded_string(", ", config), span)
             }
         }
-        Value::Duration { val: _, .. } => Value::string(input.to_expanded_string("", config), span),
+        Value::Duration { .. } => Value::string(input.to_expanded_string("", config), span),
         Value::Nothing { .. } => Value::string("".to_string(), span),
         Value::Record { .. } => Value::error(
             // Watch out for CantConvert's argument order

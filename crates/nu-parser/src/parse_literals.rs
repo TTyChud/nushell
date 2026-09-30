@@ -2,7 +2,7 @@
 
 use crate::{
     Token, TokenContents,
-    lex::lex,
+    lex::{LexState, interp_subexpr_step, lex, lex_n_tokens},
     parse_helpers::{
         SPREAD_OPERATOR_STR, extract_spread_record, garbage, is_variable, trim_quotes,
     },
@@ -15,7 +15,7 @@ use nu_protocol::{
     DidYouMean, FilesizeUnit, IntoSpanned, ParseError, Span, Spanned, SyntaxShape, Type, Unit,
     VarId, ast::*, casing::Casing, engine::StateWorkingSet,
 };
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::parse_expressions::{
     parse_block_expression, parse_closure_expression, parse_match_block_expression, parse_record,
@@ -131,63 +131,74 @@ fn decode_with_base(s: &str, base: u32, digits_per_byte: usize) -> Result<Vec<u8
         .collect()
 }
 
-fn strip_underscores(token: &[u8]) -> String {
-    String::from_utf8_lossy(token)
-        .chars()
-        .filter(|c| *c != '_')
-        .collect()
+/// Lossily decodes `token` with all `_` digit separators removed. Borrows the input when it is
+/// valid UTF-8 without underscores, which is the common case for the many bare words that are
+/// speculatively tried as numbers.
+fn strip_underscores(token: &[u8]) -> Cow<'_, str> {
+    let text = String::from_utf8_lossy(token);
+    if text.contains('_') {
+        Cow::Owned(text.chars().filter(|c| *c != '_').collect())
+    } else {
+        text
+    }
+}
+
+/// Outcome of reading an integer literal, decided before touching the working set so the
+/// token bytes can stay borrowed from it.
+enum IntLiteral {
+    Value(i64),
+    Empty,
+    InvalidDigits { radix: u32 },
+    NotInt,
 }
 
 pub fn parse_int(working_set: &mut StateWorkingSet, span: Span) -> Expression {
-    let token = working_set.get_span_contents(span);
+    let literal = {
+        let token = strip_underscores(working_set.get_span_contents(span));
 
-    fn extract_int(
-        working_set: &mut StateWorkingSet,
-        token: &str,
-        span: Span,
-        radix: u32,
-    ) -> Expression {
         // Parse as a u64, then cast to i64, otherwise, for numbers like "0xffffffffffffffef",
         // you'll get `Error parsing hex string: number too large to fit in target type`.
-        if let Ok(num) = u64::from_str_radix(token, radix).map(|val| val as i64) {
-            Expression::new(working_set, Expr::Int(num), span, Type::Int)
+        let extract_int = |digits: &str, radix: u32| match u64::from_str_radix(digits, radix) {
+            Ok(num) => IntLiteral::Value(num as i64),
+            Err(_) => IntLiteral::InvalidDigits { radix },
+        };
+
+        if token.is_empty() {
+            IntLiteral::Empty
+        } else if let Some(num) = token.strip_prefix("0b") {
+            extract_int(num, 2)
+        } else if let Some(num) = token.strip_prefix("0o") {
+            extract_int(num, 8)
+        } else if let Some(num) = token.strip_prefix("0x") {
+            extract_int(num, 16)
+        } else if let Ok(num) = token.parse::<i64>() {
+            IntLiteral::Value(num)
         } else {
+            IntLiteral::NotInt
+        }
+    };
+
+    match literal {
+        IntLiteral::Value(num) => Expression::new(working_set, Expr::Int(num), span, Type::Int),
+        IntLiteral::Empty | IntLiteral::NotInt => {
+            working_set.error(ParseError::Expected("int", span));
+            garbage(working_set, span)
+        }
+        IntLiteral::InvalidDigits { radix } => {
             working_set.error(ParseError::InvalidLiteral(
                 format!("invalid digits for radix {radix}"),
                 "int".into(),
                 span,
             ));
-
             garbage(working_set, span)
         }
-    }
-
-    let token = strip_underscores(token);
-
-    if token.is_empty() {
-        working_set.error(ParseError::Expected("int", span));
-        return garbage(working_set, span);
-    }
-
-    if let Some(num) = token.strip_prefix("0b") {
-        extract_int(working_set, num, span, 2)
-    } else if let Some(num) = token.strip_prefix("0o") {
-        extract_int(working_set, num, span, 8)
-    } else if let Some(num) = token.strip_prefix("0x") {
-        extract_int(working_set, num, span, 16)
-    } else if let Ok(num) = token.parse::<i64>() {
-        Expression::new(working_set, Expr::Int(num), span, Type::Int)
-    } else {
-        working_set.error(ParseError::Expected("int", span));
-        garbage(working_set, span)
     }
 }
 
 pub fn parse_float(working_set: &mut StateWorkingSet, span: Span) -> Expression {
-    let token = working_set.get_span_contents(span);
-    let token = strip_underscores(token);
+    let parsed = strip_underscores(working_set.get_span_contents(span)).parse::<f64>();
 
-    if let Ok(x) = token.parse::<f64>() {
+    if let Ok(x) = parsed {
         Expression::new(working_set, Expr::Float(x), span, Type::Float)
     } else {
         working_set.error(ParseError::Expected("float", span));
@@ -230,7 +241,10 @@ pub fn parse_range(working_set: &mut StateWorkingSet, span: Span) -> Option<Expr
 
     let contents = working_set.get_span_contents(span);
 
-    let Ok(token) = String::from_utf8(contents.into()) else {
+    // Everything about the operators is decided on the borrowed token, then errors are
+    // reported and the bounds parsed once the borrow is released. Most tokens reaching here are
+    // bare words tried speculatively, so this must not copy the token.
+    let Ok(token) = std::str::from_utf8(contents) else {
         working_set.error(ParseError::NonUtf8(span));
         return None;
     };
@@ -316,10 +330,13 @@ pub fn parse_range(working_set: &mut StateWorkingSet, span: Span) -> Option<Expr
         (RangeInclusion::Inclusive, op_str, op_span)
     };
 
+    let has_from = !token.starts_with("..");
+    let has_to = !token.ends_with(range_op_str);
+
     // Now, based on the operator positions, figure out where the bounds & next are located and
     // parse them
     // TODO: Actually parse the next number in the range
-    let from = if token.starts_with("..") {
+    let from = if !has_from {
         // token starts with either next operator, or range operator -- we don't care which one
         None
     } else {
@@ -332,7 +349,7 @@ pub fn parse_range(working_set: &mut StateWorkingSet, span: Span) -> Option<Expr
         ))
     };
 
-    let to = if token.ends_with(range_op_str) {
+    let to = if !has_to {
         None
     } else {
         let to_span = Span::new(range_op_span.end, span.end);
@@ -448,21 +465,23 @@ pub fn parse_raw_string(working_set: &mut StateWorkingSet, span: Span) -> Expres
     // the whole raw string should contains at least
     // 1(r) + prefix_sharp_cnt + 1(') + 1(') + postfix_sharp characters
     if bytes.len() < prefix_sharp_cnt + expect_postfix_sharp_cnt + 3 {
-        working_set.error(ParseError::Unclosed("'", span));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("'", open, span));
         return garbage(working_set, span);
     }
 
     // check for unbalanced # and single quotes.
     let postfix_bytes = &bytes[bytes.len() - expect_postfix_sharp_cnt..bytes.len()];
     if postfix_bytes.iter().any(|b| *b != b'#') {
-        working_set.error(ParseError::Unbalanced("prefix #", "postfix #", span));
+        working_set.error(ParseError::unbalanced("prefix #", "postfix #", span));
         return garbage(working_set, span);
     }
     // check for unblanaced single quotes.
     if bytes[1 + prefix_sharp_cnt] != b'\''
         || bytes[bytes.len() - expect_postfix_sharp_cnt - 1] != b'\''
     {
-        working_set.error(ParseError::Unclosed("'", span));
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("'", open, span));
         return garbage(working_set, span);
     }
 
@@ -503,8 +522,8 @@ pub fn parse_paren_expr(
         let malformed_subexpr = working_set.parse_errors[starting_error_count..]
             .first()
             .is_some_and(|e| match e {
-                ParseError::Unclosed(right, _) if (*right == ")") => true,
-                ParseError::Unbalanced(left, right, _) if *left == "(" && *right == ")" => true,
+                ParseError::Unclosed(right, ..) if (*right == ")") => true,
+                ParseError::Unbalanced(left, right, ..) if *left == "(" && *right == ")" => true,
                 _ => false,
             });
         if malformed_subexpr {
@@ -547,7 +566,19 @@ pub fn parse_brace_expr(
         return Expression::garbage(working_set, span);
     }
     let bytes = working_set.get_span_contents(Span::new(span.start + 1, span.end - 1));
-    let (tokens, _) = lex(bytes, span.start + 1, &[b'\r', b'\n', b'\t'], &[b':'], true);
+    // Only the first two tokens decide the kind of value, so lex just those instead of the
+    // whole body: the body is lexed again by whichever parser is chosen below, and for nested
+    // closures that repeated full scan dominated parse time. Newlines are additional whitespace
+    // and comments are skipped here, so no token depends on a later one and the first two
+    // tokens are the same as a full lex would produce. Lex errors are ignored as before.
+    let mut lex_state = LexState {
+        input: bytes,
+        output: Vec::new(),
+        error: None,
+        span_offset: span.start + 1,
+    };
+    lex_n_tokens(&mut lex_state, &[b'\r', b'\n', b'\t'], &[b':'], true, 2);
+    let tokens = lex_state.output;
 
     match tokens.as_slice() {
         // If we're empty, that means an empty record or closure
@@ -648,39 +679,10 @@ pub fn parse_string_interpolation(working_set: &mut StateWorkingSet, span: Span)
     let mut mode = InterpolationMode::String;
     let mut token_start = start;
 
-    #[repr(u8)]
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Delimiter {
-        SingleQuote = b'\'',
-        DoubleQuote = b'"',
-        Backtick = b'`',
-        ParenLeft = b'(',
-        ParenRight = b')',
-    }
-
-    impl Delimiter {
-        const fn from_u8(b: u8) -> Option<Self> {
-            Some(match b {
-                b'\'' => Self::SingleQuote,
-                b'"' => Self::DoubleQuote,
-                b'`' => Self::Backtick,
-                b'(' => Self::ParenLeft,
-                b')' => Self::ParenRight,
-                _ => return None,
-            })
-        }
-        const fn is_paren(self) -> bool {
-            matches!(self, Self::ParenLeft | Self::ParenRight)
-        }
-        const fn pair(self) -> Self {
-            match self {
-                Self::ParenLeft => Self::ParenRight,
-                Self::ParenRight => Self::ParenLeft,
-                _ => self,
-            }
-        }
-    }
-    let mut delimiter_stack: Vec<Delimiter> = vec![];
+    // Expected closers inside a subexpression, matched by the same shared step
+    // the lexer uses (`interp_subexpr_step`), so both scans agree on where the
+    // string ends.
+    let mut delimiter_stack: Vec<(u8, ())> = vec![];
 
     let mut consecutive_backslashes: usize = 0;
 
@@ -728,35 +730,24 @@ pub fn parse_string_interpolation(working_set: &mut StateWorkingSet, span: Span)
         }
 
         if mode == InterpolationMode::Expression {
-            let byte = Delimiter::from_u8(current_byte);
-            match (delimiter_stack.last().copied(), byte) {
-                (Some(d), Some(byte)) if !d.is_paren() => {
-                    if byte == d {
-                        delimiter_stack.pop();
-                    }
-                }
-                (_, Some(byte)) if byte != Delimiter::ParenRight => {
-                    delimiter_stack.push(byte.pair())
-                }
-                (d, Some(Delimiter::ParenRight)) => {
-                    if let Some(Delimiter::ParenRight) = d {
-                        delimiter_stack.pop();
-                    }
-                    if delimiter_stack.is_empty() {
-                        mode = InterpolationMode::String;
+            if interp_subexpr_step(&mut delimiter_stack, current_byte, ()) && b + 1 < end {
+                // Escape inside a nested double-quoted string: skip the
+                // escaped byte too, so `\"` does not close the string.
+                b += 2;
+                continue;
+            }
+            if current_byte == b')' && delimiter_stack.is_empty() {
+                mode = InterpolationMode::String;
 
-                        if token_start < b {
-                            let span = Span::new(token_start, b + 1);
+                if token_start < b {
+                    let span = Span::new(token_start, b + 1);
 
-                            let expr = parse_full_cell_path(working_set, None, span, None);
-                            output.push(expr);
-                        }
-
-                        token_start = b + 1;
-                        continue;
-                    }
+                    let expr = parse_full_cell_path(working_set, None, span, None);
+                    output.push(expr);
                 }
-                _ => (),
+
+                token_start = b + 1;
+                continue;
             }
         }
         b += 1;
@@ -830,6 +821,15 @@ pub fn parse_variable_expr(
             span,
             Type::Any,
         );
+    } else if contents.strip_prefix(b"$") == Some(nu_protocol::LAST_RESULT_VAR_NAME.as_bytes()) {
+        // Interactive last-result special (`LAST_VARIABLE_ID`). The name is reserved
+        // (see `RESERVED_VARIABLE_NAMES`); rename site-wide via `LAST_RESULT_VAR_NAME`.
+        return Expression::new(
+            working_set,
+            Expr::Var(nu_protocol::LAST_VARIABLE_ID),
+            span,
+            Type::Any,
+        );
     }
 
     let name = if contents.starts_with(b"$") {
@@ -845,6 +845,20 @@ pub fn parse_variable_expr(
             working_set.get_span_contents(span),
         )
     };
+
+    // Bare `$` (often from `$ env` with a space) is a very common config typo.
+    if bytes == b"$" {
+        working_set.error(ParseError::LabeledErrorWithHelp {
+            error: "Incomplete variable".into(),
+            label: "expected a variable name after `$`".into(),
+            help: "Variable names must be attached to `$` with no space (e.g. `$env`, `$in`). \
+                   Did you mean `$env`?"
+                .into(),
+            span,
+        });
+        return garbage(working_set, span);
+    }
+
     if !is_variable(bytes) {
         working_set.error(ParseError::ExpectedWithDidYouMean(
             "valid variable name",
@@ -1080,7 +1094,11 @@ pub fn parse_full_cell_path(
             if bytes.ends_with(b")") {
                 end -= 1;
             } else {
-                working_set.error(ParseError::Unclosed(")", Span::new(end, end)));
+                let open = Span::new(
+                    head_span.start,
+                    head_span.start.saturating_add(1).min(head_span.end),
+                );
+                working_set.error(ParseError::unclosed(")", open, Span::new(end, end)));
                 is_closed = false;
             }
 
@@ -1784,6 +1802,13 @@ pub fn unescape_string(bytes: &[u8], span: Span) -> (Vec<u8>, Option<ParseError>
                     output.push(b'~');
                     idx += 1;
                 }
+                Some(b' ') => {
+                    // Terminals (macOS Terminal, iTerm2, Ghostty) escape spaces in
+                    // dropped paths. A space needs no escaping inside quotes, so
+                    // accept it as itself.
+                    output.push(b' ');
+                    idx += 1;
+                }
                 Some(b'a') => {
                     output.push(0x7);
                     idx += 1;
@@ -1966,15 +1991,18 @@ pub fn parse_string_strict(working_set: &mut StateWorkingSet, span: Span) -> Exp
             bytes
         };
         if bytes.starts_with(b"\"") && (bytes.len() == 1 || !bytes.ends_with(b"\"")) {
-            working_set.error(ParseError::Unclosed("\"", span));
+            let open = ParseError::opener_span(span, 1);
+            working_set.error(ParseError::unclosed("\"", open, span));
             return garbage(working_set, span);
         }
         if bytes.starts_with(b"\'") && (bytes.len() == 1 || !bytes.ends_with(b"\'")) {
-            working_set.error(ParseError::Unclosed("\'", span));
+            let open = ParseError::opener_span(span, 1);
+            working_set.error(ParseError::unclosed("\'", open, span));
             return garbage(working_set, span);
         }
         if bytes.starts_with(b"r#") && (bytes.len() == 1 || !bytes.ends_with(b"#")) {
-            working_set.error(ParseError::Unclosed("r#", span));
+            let open = ParseError::opener_span(span, 2);
+            working_set.error(ParseError::unclosed("r#", open, span));
             return garbage(working_set, span);
         }
     }

@@ -4,15 +4,15 @@ use crate::{
     Value, VarId, VirtualPathId,
     ast::Block,
     engine::{
-        CachedFile, Command, CommandType, EngineState, OverlayFrame, StateDelta, Variable,
-        VirtualPath, Visibility, description::build_desc,
+        CachedFile, Command, CommandType, EngineState, OverlayFrame, ScopeBindings, StateDelta,
+        Variable, VirtualPath, Visibility, VisibilityStack, description::build_desc,
     },
 };
 use core::panic;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[cfg(feature = "plugin")]
@@ -29,9 +29,33 @@ pub struct StateWorkingSet<'a> {
     pub files: FileStack,
     /// Whether or not predeclarations are searched when looking up a command (used with aliases)
     pub search_predecls: bool,
+    /// When true, `use` / `export use` / `overlay use` / `module <file>` parse as
+    /// syntax only and do not load modules from disk or the virtual filesystem.
+    /// The REPL highlighter sets this so typing `use std` does not parse-time-load
+    /// the standard library on every keystroke.
+    pub skip_module_load: bool,
     pub parse_errors: Vec<ParseError>,
     pub parse_warnings: Vec<ParseWarning>,
     pub compile_errors: Vec<CompileError>,
+    /// Signatures of *permanent* declarations, built lazily the first time the parser needs
+    /// them and shared for the rest of this working set's life. `Command::signature()` rebuilds
+    /// a `Signature` (several heap allocations) on every call, and the parser asks for it at
+    /// least twice per call site (argument parsing and pipeline type checking), so a file that
+    /// calls the same command many times would otherwise rebuild it many times.
+    ///
+    /// Only permanent declarations are cached: they, and the permanent blocks that back custom
+    /// commands, cannot change while this working set borrows the `EngineState`. Declarations
+    /// in the delta are never cached because `def` replaces a predeclaration's signature in
+    /// place while parsing.
+    ///
+    /// The two caches mirror the two ways the parser reads a signature: the effective signature
+    /// from [`StateWorkingSet::get_signature`] (block-backed commands report their block's
+    /// signature) and the declaration's own `Command::signature()`. They are maps rather than
+    /// id-indexed vectors so that a tiny parse (a REPL line) only pays for the few commands it
+    /// uses. A `Mutex` (never contended; the working set is single-threaded) keeps the type
+    /// `Sync` for miette.
+    permanent_signatures: Mutex<HashMap<DeclId, Arc<Signature>>>,
+    permanent_decl_signatures: Mutex<HashMap<DeclId, Arc<Signature>>>,
 }
 
 impl<'a> StateWorkingSet<'a> {
@@ -48,9 +72,12 @@ impl<'a> StateWorkingSet<'a> {
             permanent_state,
             files,
             search_predecls: true,
+            skip_module_load: false,
             parse_errors: vec![],
             parse_warnings: vec![],
             compile_errors: vec![],
+            permanent_signatures: Mutex::new(HashMap::new()),
+            permanent_decl_signatures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,13 +170,8 @@ impl<'a> StateWorkingSet<'a> {
     }
 
     pub fn use_variables(&mut self, variables: Vec<(Vec<u8>, VarId)>) {
-        let overlay_frame = self.last_overlay_mut();
-
-        for (mut name, var_id) in variables {
-            if !name.starts_with(b"$") {
-                name.insert(0, b'$');
-            }
-            overlay_frame.insert_variable(name, var_id);
+        for (name, var_id) in variables {
+            self.insert_variable_into_scope(name, var_id);
         }
     }
 
@@ -393,6 +415,7 @@ impl<'a> StateWorkingSet<'a> {
         result.covered_span
     }
 
+    #[inline]
     pub fn get_span_contents(&self, span: Span) -> &[u8] {
         let permanent_end = self.permanent_state.next_span_start();
         if permanent_end <= span.start {
@@ -443,7 +466,7 @@ impl<'a> StateWorkingSet<'a> {
     pub fn find_decl(&self, name: &[u8]) -> Option<DeclId> {
         let mut removed_overlays = vec![];
 
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for scope_frame in self.delta.scope.iter().rev() {
             if self.search_predecls
@@ -455,7 +478,7 @@ impl<'a> StateWorkingSet<'a> {
 
             // check overlay in delta
             for overlay_frame in scope_frame.active_overlays(&mut removed_overlays).rev() {
-                visibility.append(&overlay_frame.visibility);
+                visibility.push(&overlay_frame.visibility);
 
                 if self.search_predecls
                     && let Some(decl_id) = overlay_frame.predecls.get(name)
@@ -483,7 +506,7 @@ impl<'a> StateWorkingSet<'a> {
     pub fn find_decl_name(&self, decl_id: DeclId) -> Option<&[u8]> {
         let mut removed_overlays = vec![];
 
-        let mut visibility: Visibility = Visibility::new();
+        let mut visibility = VisibilityStack::default();
 
         for scope_frame in self.delta.scope.iter().rev() {
             if self.search_predecls {
@@ -496,7 +519,7 @@ impl<'a> StateWorkingSet<'a> {
 
             // check overlay in delta
             for overlay_frame in scope_frame.active_overlays(&mut removed_overlays).rev() {
-                visibility.append(&overlay_frame.visibility);
+                visibility.push(&overlay_frame.visibility);
 
                 if self.search_predecls {
                     for (name, id) in overlay_frame.predecls.iter() {
@@ -636,6 +659,12 @@ impl<'a> StateWorkingSet<'a> {
         if !name.starts_with(b"$") {
             name.insert(0, b'$');
         }
+        // Record the name on delta variables so `scope variables` can list stack locals
+        // that never enter permanent overlays. Permanent vars keep `name: None` here;
+        // their names remain available through permanent overlay maps.
+        if let Some(var) = self.get_variable_mut(var_id) {
+            var.name = Some(name.clone());
+        }
         self.last_overlay_mut().insert_variable(name, var_id);
     }
 
@@ -693,12 +722,48 @@ impl<'a> StateWorkingSet<'a> {
         }
     }
 
+    /// Mutable access to a variable that still lives in the working-set delta.
+    ///
+    /// Returns `None` for variables that already belong to the permanent engine state.
+    pub fn get_variable_mut(&mut self, var_id: VarId) -> Option<&mut Variable> {
+        let num_permanent_vars = self.permanent_state.num_vars();
+        if var_id.get() < num_permanent_vars {
+            None
+        } else {
+            self.delta.vars.get_mut(var_id.get() - num_permanent_vars)
+        }
+    }
+
     pub fn get_variable_if_possible(&self, var_id: VarId) -> Option<&Variable> {
         let num_permanent_vars = self.permanent_state.num_vars();
         if var_id.get() < num_permanent_vars {
             Some(self.permanent_state.get_var(var_id))
         } else {
             self.delta.vars.get(var_id.get() - num_permanent_vars)
+        }
+    }
+
+    /// Snapshot command/module bindings from the **innermost** scope frame.
+    ///
+    /// # Invariant
+    ///
+    /// Must run on the scope frame that owns the block's locals, **immediately before** the
+    /// matching `exit_scope` (which discards that frame). Call sites:
+    /// `parse_block_expression`, `parse_closure_expression`, and scoped `parse_block`.
+    /// Keep those three call sites explicit so a new scoped construct is forced to opt in.
+    pub fn snapshot_scope_bindings(&self) -> Option<Arc<ScopeBindings>> {
+        let frame = self.delta.last_scope_frame();
+        let mut bindings = ScopeBindings::default();
+        let mut removed_overlays = vec![];
+
+        for overlay in frame.active_overlays(&mut removed_overlays) {
+            bindings.extend_from_overlay(overlay);
+        }
+
+        if bindings.is_empty() {
+            None
+        } else {
+            Some(Arc::new(bindings))
         }
     }
 
@@ -746,6 +811,44 @@ impl<'a> StateWorkingSet<'a> {
         } else {
             decl.signature()
         }
+    }
+
+    /// Shared version of [`StateWorkingSet::get_signature`] for the declaration `decl_id`.
+    ///
+    /// Permanent declarations are built once per working set and then returned from a cache;
+    /// declarations in the delta are rebuilt on every call, exactly like `get_signature`.
+    pub fn get_signature_shared(&self, decl_id: DeclId) -> Arc<Signature> {
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return Arc::new(self.get_signature(self.get_decl(decl_id)));
+        }
+        let mut cache = self
+            .permanent_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            cache
+                .entry(decl_id)
+                .or_insert_with(|| Arc::new(self.get_signature(self.get_decl(decl_id)))),
+        )
+    }
+
+    /// Shared version of `Command::signature()` for the declaration `decl_id`, i.e. the
+    /// declaration's own signature rather than the one on its block.
+    ///
+    /// Cached for permanent declarations, rebuilt on every call for delta declarations.
+    pub fn get_decl_signature_shared(&self, decl_id: DeclId) -> Arc<Signature> {
+        if decl_id.get() >= self.permanent_state.num_decls() {
+            return Arc::new(self.get_decl(decl_id).signature());
+        }
+        let mut cache = self
+            .permanent_decl_signatures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            cache
+                .entry(decl_id)
+                .or_insert_with(|| Arc::new(self.get_decl(decl_id).signature())),
+        )
     }
 
     /// Apply a function to all commands. The function accepts a command name and its DeclId
@@ -1023,6 +1126,37 @@ impl<'a> StateWorkingSet<'a> {
             }
         }
 
+        None
+    }
+
+    /// Blocks covering `span`, newest first (delta before permanent).
+    pub fn blocks_with_span_newest_first(&self, span: Span) -> Vec<Arc<Block>> {
+        let mut blocks = Vec::new();
+        for block in self.delta.blocks.iter().rev() {
+            if block.span == Some(span) {
+                blocks.push(block.clone());
+            }
+        }
+        for block in self.permanent_state.blocks.iter().rev() {
+            if block.span == Some(span) {
+                blocks.push(block.clone());
+            }
+        }
+        blocks
+    }
+
+    /// Identity lookup so a cache hit can keep the existing `BlockId`.
+    pub fn find_block_id_of(&self, block: &Arc<Block>) -> Option<BlockId> {
+        for (idx, existing) in self.delta.blocks.iter().enumerate() {
+            if Arc::ptr_eq(existing, block) {
+                return Some(BlockId::new(self.permanent_state.num_blocks() + idx));
+            }
+        }
+        for (idx, existing) in self.permanent_state.blocks.iter().enumerate() {
+            if Arc::ptr_eq(existing, block) {
+                return Some(BlockId::new(idx));
+            }
+        }
         None
     }
 
